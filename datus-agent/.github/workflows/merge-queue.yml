@@ -1,0 +1,329 @@
+name: "Merge Queue Gate"
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: merge-queue-gate-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  merge-queue-gate:
+    name: Merge Queue Gate
+    runs-on: self-hosted
+    steps:
+      - name: Publish PR gate context
+        if: ${{ github.event_name == 'pull_request_target' }}
+        run: |
+          echo "Merge Queue Gate publishes this lightweight PR check context."
+          echo "The deterministic merge queue suites run on merge_group before merge."
+
+      - name: Checkout code
+        if: ${{ github.event_name != 'pull_request_target' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        if: ${{ github.event_name != 'pull_request_target' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip dependencies
+        if: ${{ github.event_name != 'pull_request_target' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-merge-queue-${{ hashFiles('requirements.txt', 'requirements-test.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-merge-queue-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+          pip install --upgrade --no-cache-dir \
+            "datus-metricflow @ https://github.com/Datus-ai/metricflow/archive/95fe9271d2fbe1e12797595b2d841c84c1ce6f3d.tar.gz" \
+            "datus-semantic-metricflow @ https://github.com/Datus-ai/datus-semantic-adapter/archive/002b93e39b906f42ecf9bc513ace3c1594139462.tar.gz#subdirectory=datus-semantic-metricflow"
+          pip install packaging==26.2
+
+      - name: Check release metadata
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: python3 ci/check_release_readiness.py
+
+      - name: Validate harness coverage map
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: |
+          set +e
+          python3 ci/harness/validate_coverage_map.py \
+            --strict \
+            --report-json ci/harness/coverage-map-report.json \
+            --report-md ci/harness/coverage-map-report.md
+          validation_exit=$?
+          set -e
+          if [ -f ci/harness/coverage-map-report.md ]; then
+            cat ci/harness/coverage-map-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$validation_exit"
+
+      - name: Setup config file
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: |
+          cp /home/datus_ci/ci_template/agent.yml conf/agent.yml
+          cp /home/datus_ci/ci_template/ci.env .env
+
+      - name: Restore tracked test config
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: git restore --source=HEAD --worktree --staged tests/conf/agent.yml
+
+      - name: Isolate test data directory
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: |
+          DATUS_TEST_HOME="${GITHUB_WORKSPACE}/.datus_test_data"
+          echo "DATUS_TEST_HOME=$DATUS_TEST_HOME" >> "$GITHUB_ENV"
+          sed -i "s|home: .datus_test_data|home: $DATUS_TEST_HOME|g" tests/conf/agent.yml
+          sed -i "s|project_root: .datus_test_data/workspace|project_root: $DATUS_TEST_HOME/workspace|g" tests/conf/agent.yml
+
+      - name: Load environment variables
+        if: ${{ github.event_name != 'pull_request_target' }}
+        run: |
+          while IFS= read -r line || [ -n "$line" ]; do
+            if [[ ! -z "$line" && ! "$line" =~ ^[[:space:]]*# ]]; then
+              var_value=$(echo "$line" | cut -d'=' -f2-)
+              echo "::add-mask::$var_value"
+              echo "$line" >> "$GITHUB_ENV"
+            fi
+          done < .env
+
+      - name: Run deterministic merge queue suites
+        if: ${{ github.event_name != 'pull_request_target' }}
+        env:
+          DATUS_CI_PYTEST_BASETEMP: ${{ runner.temp }}/datus-agent-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 ci/run-merge-queue-tests.py
+
+      - name: Cleanup pytest temp
+        if: ${{ always() && github.event_name != 'pull_request_target' }}
+        env:
+          DATUS_CI_PYTEST_BASETEMP: ${{ runner.temp }}/datus-agent-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+          RUNNER_TEMP_ROOT: ${{ runner.temp }}
+        run: |
+          if [ -z "$DATUS_CI_PYTEST_BASETEMP" ]; then
+            exit 0
+          fi
+          target="$(realpath -m "$DATUS_CI_PYTEST_BASETEMP")"
+          runner_temp="$(realpath -m "$RUNNER_TEMP_ROOT")"
+          home_dir="$(realpath -m "$HOME")"
+          workspace="$(realpath -m "$GITHUB_WORKSPACE")"
+          case "$target" in
+            "$runner_temp"/*) ;;
+            *) echo "Refusing to remove unsafe pytest temp: $target"; exit 0 ;;
+          esac
+          if [ "$target" = "/" ] || [ "$target" = "$runner_temp" ] || [ "$target" = "$home_dir" ] || [ "$target" = "$workspace" ]; then
+            echo "Refusing to remove unsafe pytest temp: $target"
+            exit 0
+          fi
+          rm -rf "$target"
+
+      - name: Upload merge queue artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && github.event_name != 'pull_request_target' }}
+        with:
+          name: merge-queue-results
+          path: |
+            ci/merge-queue-results.json
+            ci/test-results-merge-*.xml
+
+  notify-failure:
+    name: Notify Merge Queue Failure
+    needs:
+      - merge-queue-gate
+    if: ${{ always() && needs.merge-queue-gate.result == 'failure' }}
+    runs-on: self-hosted
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout notification helper
+        if: ${{ github.event_name == 'merge_group' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Download merge queue artifacts
+        if: ${{ github.event_name == 'merge_group' }}
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: merge-queue-results
+          path: ci/merge-queue-artifacts
+
+      - name: Build PR failure comment
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          python3 ci/build_merge_queue_failure_comment.py \
+            --artifacts-dir ci/merge-queue-artifacts \
+            --output ci/merge-queue-failure-comment.md \
+            --repository "${{ github.repository }}" \
+            --workflow "${{ github.workflow }}" \
+            --event "${{ github.event_name }}" \
+            --ref "${{ github.ref }}" \
+            --sha "${{ github.sha }}" \
+            --run-number "${{ github.run_number }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Comment on PR with merge queue failure
+        if: ${{ github.event_name == 'merge_group' }}
+        uses: actions/github-script@v7
+        env:
+          COMMENT_PATH: ci/merge-queue-failure-comment.md
+        with:
+          script: |
+            const fs = require('fs');
+            const commentPath = process.env.COMMENT_PATH;
+            if (!fs.existsSync(commentPath)) {
+              core.warning(`Merge queue failure comment was not generated: ${commentPath}`);
+              return;
+            }
+
+            const body = fs.readFileSync(commentPath, 'utf8');
+            const marker = '<!-- datus-merge-queue-failure-comment -->';
+            const sources = [
+              context.ref,
+              context.payload?.merge_group?.head_ref,
+              context.payload?.merge_group?.base_ref,
+            ].filter(Boolean).join('\n');
+            const prNumbers = [
+              ...new Set([...sources.matchAll(/(?:^|[/-])pr-(\d+)(?=[/-]|$)/g)].map((match) => Number(match[1]))),
+            ];
+
+            if (prNumbers.length === 0) {
+              core.warning(`Unable to determine PR number from merge queue ref: ${context.ref}`);
+              return;
+            }
+
+            for (const issue_number of prNumbers) {
+              let existing = null;
+              for await (const response of github.paginate.iterator(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                per_page: 100,
+              })) {
+                existing = response.data.find(
+                  (comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker),
+                );
+                if (existing) {
+                  break;
+                }
+              }
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number,
+                  body,
+                });
+              }
+            }
+
+      - name: Send Feishu failure notification
+        uses: actions/github-script@v7
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_NOTIFY_CI_URL }}
+          NEEDS_JSON: ${{ toJson(needs) }}
+        with:
+          script: |
+            const https = require('https');
+            const webhook = process.env.FEISHU_WEBHOOK_URL;
+            if (!webhook) {
+              core.warning('FEISHU_WEBHOOK_URL is not set; skipping Feishu notification.');
+              return;
+            }
+
+            const needs = JSON.parse(process.env.NEEDS_JSON || '{}');
+            const failedJobs = Object.entries(needs)
+              .filter(([, job]) => job.result === 'failure')
+              .map(([name]) => name)
+              .join(', ') || 'unknown';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const messageBody = `## Merge Queue Failure
+
+            **Repository:** ${context.repo.owner}/${context.repo.repo}
+            **Workflow:** ${context.workflow}
+            **Event:** ${context.eventName}
+            **Ref:** ${context.ref}
+            **SHA:** ${context.sha}
+            **Failed jobs:** ${failedJobs}
+            **Run:** [#${context.runNumber}](${runUrl})
+
+            *Automated Feishu notification from GitHub Actions.*`;
+
+            const url = new URL(webhook);
+            const data = JSON.stringify({
+              msg_type: 'interactive',
+              card: {
+                type: 'template',
+                data: {
+                  template_id: 'AAqz7JC34dHlY',
+                  template_version_name: '1.0.0',
+                  template_variable: {
+                    report_result: messageBody,
+                  },
+                },
+              },
+            });
+
+            await new Promise((resolve) => {
+              const req = https.request(
+                {
+                  hostname: url.hostname,
+                  port: url.port || 443,
+                  path: url.pathname + url.search,
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(data),
+                  },
+                },
+                (res) => {
+                  res.resume();
+                  res.on('end', () => {
+                    if (res.statusCode >= 400) {
+                      core.warning(`Feishu notification returned HTTP ${res.statusCode}`);
+                    } else {
+                      console.log(`Feishu notification sent: ${res.statusCode}`);
+                    }
+                    resolve();
+                  });
+                },
+              );
+              req.on('error', (error) => {
+                core.warning(`Error sending Feishu notification: ${error.message}`);
+                resolve();
+              });
+              req.write(data);
+              req.end();
+            });

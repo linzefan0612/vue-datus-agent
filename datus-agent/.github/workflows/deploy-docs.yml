@@ -1,0 +1,95 @@
+name: Deploy Docs
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+      - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to deploy into its minor docs line, e.g. v0.3.7 -> 0.3. Uses dev if empty.'
+        required: false
+        default: ''
+permissions:
+  contents: write
+env:
+  DOCS_MIN_VISIBLE_MINOR: "0.2"
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure Git Credentials
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
+      - uses: actions/cache@v4
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: ~/.cache
+          restore-keys: |
+            mkdocs-material-
+      - run: pip install -r requirements-docs.txt
+      - name: Fetch published docs branch
+        run: git fetch origin gh-pages --depth=1 || true
+      - name: Detect existing published docs versions
+        run: |
+          versions_json="$(mike list -j 2>/dev/null || echo '[]')"
+          if [[ "${versions_json}" == "[]" ]]; then
+            echo "DOCS_HAS_PUBLISHED_VERSIONS=false" >> "${GITHUB_ENV}"
+          else
+            echo "DOCS_HAS_PUBLISHED_VERSIONS=true" >> "${GITHUB_ENV}"
+          fi
+      - name: Resolve docs version metadata
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_TYPE_VALUE: ${{ github.ref_type }}
+          GITHUB_REF_NAME_VALUE: ${{ github.ref_name }}
+        run: |
+          versions_json="$(mike list -j 2>/dev/null || echo '[]')"
+          PUBLISHED_DOCS_JSON="${versions_json}" python ci/docs_versioning.py resolve \
+            --input-version "${INPUT_VERSION}" \
+            --event-name "${EVENT_NAME}" \
+            --github-ref-type "${GITHUB_REF_TYPE_VALUE}" \
+            --github-ref-name "${GITHUB_REF_NAME_VALUE}" >> "${GITHUB_ENV}"
+      - name: Prepare docs build context
+        if: env.DOCS_SKIP_DEPLOY != 'true' && env.DOCS_SOURCE_REF != ''
+        run: |
+          BUILD_ROOT="$(mktemp -d)"
+          DOCS_BUILD_ROOT="${BUILD_ROOT}/docs_build"
+          python ci/prepare_docs_build.py \
+            --base-config mkdocs.yml \
+            --output-root "${DOCS_BUILD_ROOT}" \
+            --source-ref "${DOCS_SOURCE_REF}"
+          echo "DOCS_BUILD_CONFIG=${DOCS_BUILD_ROOT}/mkdocs.yml" >> "${GITHUB_ENV}"
+      - run: mkdocs build --strict -f "${DOCS_BUILD_CONFIG}"
+        if: env.DOCS_SKIP_DEPLOY != 'true'
+      - name: Deploy versioned docs
+        if: env.DOCS_SKIP_DEPLOY != 'true'
+        run: |
+          if [[ -n "${DOCS_ALIASES}" ]]; then
+            mike deploy -F "${DOCS_BUILD_CONFIG}" --push --update-aliases "${DOCS_VERSION}" "${DOCS_ALIASES}"
+          else
+            mike deploy -F "${DOCS_BUILD_CONFIG}" --push "${DOCS_VERSION}"
+          fi
+      - name: Set default docs version
+        if: env.DOCS_SKIP_DEPLOY != 'true'
+        run: |
+          if [[ -n "${DOCS_SET_DEFAULT}" ]]; then
+            mike set-default -F "${DOCS_BUILD_CONFIG}" --push "${DOCS_SET_DEFAULT}"
+          elif [[ "${DOCS_HAS_PUBLISHED_VERSIONS}" == "false" ]]; then
+            mike set-default -F "${DOCS_BUILD_CONFIG}" --push "${DOCS_VERSION}"
+          fi
+      - name: Hide legacy docs versions
+        if: env.DOCS_SKIP_DEPLOY != 'true'
+        run: |
+          python ci/docs_versioning.py hide-legacy --min-visible-minor "${DOCS_MIN_VISIBLE_MINOR}"
