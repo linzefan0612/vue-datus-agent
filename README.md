@@ -8,7 +8,7 @@
 
 - **前端 (frontend)**: 基于 Vue 3 + TypeScript 构建的现代化 Web 界面
 - **后端 (datus-agent)**: 基于 Python 的 AI 数据工程 Agent 服务
-- **扩展模块 (datus_fund)**: 面向基金行业的下游扩展，提供 API 接口增强和数据源访问控制
+- **扩展模块 (datus_fund)**: 下游扩展，提供 API 接口增强和数据源访问控制
 
 ---
 
